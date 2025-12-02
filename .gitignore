@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+emocion-env/
+emotion_reports/
+.env
+.DS_Store
