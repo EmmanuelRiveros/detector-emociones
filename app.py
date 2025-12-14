@@ -1,13 +1,13 @@
 import streamlit as st
 import cv2
-from fer import FER
+from tensorflow.keras.models import load_model
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import time
 import plotly.graph_objects as go
 import random
-import db
+# import db (Desactivado por solicitud)
 import tempfile
 import os
 import json
@@ -70,7 +70,13 @@ if 'start_time' not in st.session_state:
 if 'emotion_data' not in st.session_state:
     st.session_state.emotion_data = pd.DataFrame()
 if 'detector' not in st.session_state:
-    st.session_state.detector = FER(mtcnn=True)
+    # Cargar modelo custom
+    try:
+        st.session_state.model = load_model('modelo_emociones_custom.h5')
+        st.session_state.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+    except Exception as e:
+        st.error(f"Error cargando modelo o cascade: {e}")
+        st.session_state.model = None
 if 'frame_count' not in st.session_state:
     st.session_state.frame_count = 0
 if 'visible_emotions' not in st.session_state:
@@ -120,14 +126,31 @@ def create_emotion_dataframe(emotions_dict, timestamp):
     return pd.DataFrame([row])
 
 def detect_emotions_from_frame(frame):
-    try:
-        results = st.session_state.detector.detect_emotions(frame)
-        if results and len(results) > 0:
-            return results[0]['emotions'], results[0]['box']
+    if st.session_state.model is None:
         return None, None
-    except Exception as e:
-        st.error(f"Error detecting emotions: {str(e)}")
-        return None, None
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    faces = st.session_state.face_cascade.detectMultiScale(gray, 1.3, 5)
+    
+    if len(faces) > 0:
+        # Tomar solo la primera cara para simplificar (o iterar si se prefiere)
+        # Aquí mantenemos la lógica original de retornar solo 1 set de emociones
+        (x, y, w, h) = faces[0]
+        
+        # Preprocesamiento para el modelo
+        roi_color = frame[y:y+h, x:x+w]
+        final_image = cv2.resize(roi_color, (48, 48))
+        final_image = np.expand_dims(final_image, axis=0) # Agregar batch dim
+        final_image = final_image / 255.0 # Normalizar
+        
+        prediction = st.session_state.model.predict(final_image)
+        
+        # Mapear predicción a diccionario
+        emotions_dict = {emotion: float(prediction[0][i]) for i, emotion in enumerate(EMOTIONS_ORDER)}
+        
+        return emotions_dict, (x, y, w, h)
+        
+    return None, None
 
 def create_realtime_graph(df):
     if df.empty or len(df) < 2:
@@ -315,58 +338,20 @@ def display_session_report(report_data, emotion_df):
 with st.sidebar:
     st.title("Panel de control")
     st.markdown("---")
-    st.session_state.page = st.selectbox("Página", ["Control", "Historial", "Administrar"], index=["Control", "Historial", "Administrar"].index(st.session_state.page) if st.session_state.page in ["Control", "Historial", "Administrar"] else 0)
+    st.title("Panel de control")
     st.markdown("---")
-    def registrar_usuario():
-        # Leemos el nombre desde el session_state
-        patient_name_to_add = st.session_state.new_patient_name_input.strip()
-        
-        if patient_name_to_add:
-            try:
-                user_id = db.create_user(patient_name_to_add)
-                st.success("Usuario registrado")
-                st.session_state.user_id = user_id
-                st.session_state.user_name = patient_name_to_add
-                
-                # 2. ¡El truco! Limpiamos el valor AQUÍ
-                st.session_state.new_patient_name_input = "" 
-                
-            except Exception as e:
-                st.error(f"Error al registrar usuario: {e}")
-        else:
-            st.warning("Escribe un nombre válido")
-    # Load patients
-    try:
-        patients = db.get_users()
-    except Exception as e:
-        patients = []
-        st.error("Error cargando Usuarios desde la base de datos. Revisa la conexión.")
-    patient_names = [p["name"] for p in patients]
-
-    st.markdown("## Usuarios")
-    selected_patient = st.selectbox("Selecciona usuario", ["-- Nuevo / Ninguno --"] + patient_names)
+    # Simplificamos las páginas ya que Historial y Admin requieren DB
+    st.session_state.page = "Control" 
     
-    if 'new_patient_name_input' not in st.session_state:
-        st.session_state.new_patient_name_input = ""
-
-    new_patient_name = st.text_input("Registrar nuevo usuario", key='new_patient_name_input')
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.button(
-            "Registrar usuario",
-            on_click=registrar_usuario
-        )
-    with col2:
-        if st.button("Recargar Usuarios"):
-            st.rerun()
-
-    # Set user_id if selected from list
-    if selected_patient in patient_names:
-        user = next((p for p in patients if p["name"] == selected_patient), None)
-        if user:
-            st.session_state.user_id = user["id"]
-            st.session_state.user_name = user["name"]
+    st.markdown("## Usuario")
+    # Entrada de texto simple para el nombre, sin guardar en DB
+    if st.session_state.user_name is None:
+        st.session_state.user_name = "Invitado"
+        
+    user_name_input = st.text_input("Nombre de usuario", value=st.session_state.user_name)
+    if user_name_input:
+        st.session_state.user_name = user_name_input
+        st.session_state.user_id = 999 # ID dummy
 
     st.markdown("---")
     st.markdown("Modo")
@@ -398,12 +383,7 @@ if st.session_state.page == "Control":
                     st.session_state.show_report = False
                     st.session_state.last_detected_emotions = None
                     # Create session in DB
-                    try:
-                        session_db_id = db.create_session(st.session_state.user_id, st.session_state.start_time)
-                        st.session_state.session_id = session_db_id
-                    except Exception as e:
-                        st.error(f"Error creando sesión en la base de datos: {e}")
-                        st.session_state.session_active = False
+                    st.session_state.session_id = int(time.time()) # ID dummy basado en tiempo
                     st.rerun()
         else:
             if st.button("Detener Sesión", type="secondary"):
@@ -458,10 +438,8 @@ if st.session_state.page == "Control":
                                     graph_placeholder.plotly_chart(create_realtime_graph(st.session_state.emotion_data), use_column_width=True)
 
                                 # Save to DB
-                                try:
-                                    db.save_emotion_record(st.session_state.session_id, elapsed, emotions)
-                                except Exception as e:
-                                    st.warning(f"No se guardó un registro en la BDD: {e}")
+                                # db.save_emotion_record (Desactivado)
+                                pass
 
                         else:
                             # No face detected
@@ -476,10 +454,8 @@ if st.session_state.page == "Control":
                                 if len(st.session_state.emotion_data) > 1:
                                     graph_placeholder.plotly_chart(create_realtime_graph(st.session_state.emotion_data), use_column_width=True)
 
-                                try:
-                                    db.save_emotion_record(st.session_state.session_id, elapsed, zero_emotions)
-                                except Exception as e:
-                                    st.warning(f"No se guardó un registro en la BDD: {e}")
+                                # db.save_emotion_record (Desactivado)
+                                pass
 
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     video_placeholder.image(frame_rgb, channels="RGB", use_column_width=True)
@@ -500,29 +476,8 @@ if st.session_state.page == "Control":
             display_session_report(report_data, st.session_state.emotion_data)
             
             # Save final info to DB
-            try:
-                db.finish_session(
-                    st.session_state.session_id,
-                    report_data["end_time"],
-                    int(report_data["duration"].total_seconds()),
-                    report_data["total_frames"]
-                )
-  
-                #    Necesitamos convertir los objetos 'datetime' y 'timedelta'
-                report_data_para_json = report_data.copy()
-
-                # Convertir 'datetime' a string (formato ISO)
-                report_data_para_json['start_time'] = report_data_para_json['start_time'].isoformat()
-                report_data_para_json['end_time'] = report_data_para_json['end_time'].isoformat()
-                
-                # Convertir 'timedelta' a segundos (número)
-                report_data_para_json['duration'] = report_data_para_json['duration'].total_seconds()
-                
-                # 3. Guardar el reporte JSON con los datos ya convertidos
-                db.save_session_report(st.session_state.session_id, report_data_para_json)
-            
-            except Exception as e:
-                st.warning(f"No se pudo guardar la información final en la BDD: {e}")
+            # Guardado en DB desactivado
+            # display_session_report ya muestra los datos en pantalla
 
             if st.button("🔄 Nueva Sesión", type="primary"):
                 st.session_state.show_report = False
@@ -673,116 +628,6 @@ if st.session_state.page == "Control":
 # ---------------------------
 # Page: HISTORIAL (view previous sessions)
 # ---------------------------
-elif st.session_state.page == "Historial":
-    st.subheader("Historial de Sesiones")
-    if st.session_state.user_id is None:
-        st.info("Selecciona un usuario en la barra lateral para ver su historial")
-    else:
-        try:
-            sessions = db.get_sessions_by_user(st.session_state.user_id)
-        except Exception as e:
-            sessions = []
-            st.error(f"Error obteniendo sesiones: {e}")
-
-        if not sessions:
-            st.info("No hay sesiones registradas para este usuario")
-        else:
-            session_options = [f"{s['id']} ({s['start_time']})" for s in sessions]
-            
-            st.markdown("---")
-            sel_session_str = st.selectbox("Selecciona sesión para cargar", ["-- Ninguna --"] + session_options)
-            
-            if sel_session_str != "-- Ninguna --":
-                sid = None
-                try:
-                    # 3. Extraemos el ID del string (ej: "3 (2025-...)")
-                    sid = int(sel_session_str.split(" ")[0])
-                except (ValueError, IndexError):
-                    st.error("Error al leer el ID de la sesión.")
-
-                if sid:
-                    # (El resto de tu lógica para cargar reportes sigue aquí...)
-                    try:
-                        records = db.get_emotion_records(sid)
-                        records_df = pd.DataFrame(records)
-                        
-                        if not records_df.empty:
-                            if 'time_seconds' not in records_df.columns:
-                                records_df['time_seconds'] = range(len(records_df))
-                            
-                            # Mostrar reporte si existe
-                            try:
-                                report = db.get_report(sid)
-                            except Exception as e:
-                                report = None
-                                st.warning(f"No se pudo cargar reporte desde BDD: {e}")
-
-                            if report:
-                                display_session_report(report, records_df)
-                            else:
-                                # Generar reporte "on the fly"
-                                st.info("No se encontró reporte guardado, generando uno nuevo...")
-                                generated = generate_report_data(records_df, sid, datetime.now(), datetime.now()) # Nota: las fechas pueden no ser precisas
-                                if generated:
-                                    display_session_report(generated, records_df)
-                        else:
-                            st.warning("No hay registros emocionales para esta sesión")
-                    except Exception as e:
-                        st.error(f"Error cargando registros de la sesión: {e}")
-
-# ---------------------------
-# Page: ADMINISTRAR (delete patients / sessions)
-# ---------------------------
-elif st.session_state.page == "Administrar":
-    st.subheader("Administrar Usuarios y Sesiones")
-    st.markdown("**Eliminar sesión**")
-    try:
-        patients = db.get_users()
-    except Exception as e:
-        patients = []
-        st.error("Error cargando Usuarios")
-
-    patient_map = {p["name"]: p["id"] for p in patients}
-    sel_patient_for_admin = st.selectbox("Selecciona usuario", ["-- Ninguno --"] + list(patient_map.keys()))
-    if sel_patient_for_admin != "-- Ninguno --":
-        uid = patient_map[sel_patient_for_admin]
-        try:
-            sessions = db.get_sessions_by_user(uid)
-        except Exception as e:
-            sessions = []
-            st.error("Error cargando sesiones del usuario")
-        if sessions:
-            sel_session = st.selectbox("Selecciona sesión a eliminar", ["-- Ninguna --"] + [str(s['id']) + " | " + str(s.get('start_time')) for s in sessions])
-            if sel_session != "-- Ninguna --":
-                sid = int(sel_session.split("|")[0].strip())
-                if st.button("Eliminar sesión seleccionada"):
-                    try:
-                        if hasattr(db, "delete_session"):
-                            db.delete_session(sid)
-                            st.success("Sesión eliminada")
-                            st.rerun()
-                        else:
-                            st.error("La función delete_session no existe en db.py")
-                    except Exception as e:
-                        st.error(f"Error eliminando sesión: {e}")
-        else:
-            st.info("El usuario no tiene sesiones")
-
-    st.markdown("---")
-    st.markdown("**Eliminar usuario**")
-    sel_patient_del = st.selectbox("Selecciona usuario a eliminar", ["-- Ninguno --"] + list(patient_map.keys()))
-    if sel_patient_del != "-- Ninguno --":
-        uid_del = patient_map[sel_patient_del]
-        st.warning("Eliminar un usuario también va a eliminar sus sesiones asociadas")
-        if st.button("Eliminar usuario seleccionado"):
-            try:
-                if hasattr(db, "delete_user"):
-                    db.delete_user(uid_del)
-                    st.success("Usuario eliminado")
-                    st.rerun()
-                else:
-                    st.error("La función delete_user no existe en db.py")
-            except Exception as e:
-                st.error(f"Error eliminando usuario: {e}")
+# Páginas Historial y Administrar eliminadas por no usar DB
 
 # End of file
